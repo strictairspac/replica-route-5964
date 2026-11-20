@@ -1,15 +1,35 @@
 """Deterministic routing replay: integer log positions in a named lineage, never a live replica probe."""
 import copy,hashlib,json
 
-def simulate(node_inputs,events,max_delay_ms,sticky_ms):
+def validate_nodes(node_inputs):
     if not 1<=len(node_inputs)<=12:raise ValueError('需要1–12个节点')
-    if not 1<=len(events)<=100:raise ValueError('需要1–100个时序事件')
-    if max_delay_ms<0 or sticky_ms<0:raise ValueError('延迟门槛和粘滞时间不得为负')
     if len({x['name'] for x in node_inputs})!=len(node_inputs):raise ValueError('节点名必须唯一')
     primaries=[x for x in node_inputs if x['role']=='primary']
     if len(primaries)!=1:raise ValueError('必须且只能配置一个主节点')
-    nodes={x['name']:copy.deepcopy(x) for x in node_inputs};primary=nodes[primaries[0]['name']];lineage=primary['lineage'];sessions={};trace=[];last_time=-1
-    if any(n['role']=='replica' and n['lineage']==lineage and n['position']>primary['position'] for n in nodes.values()):raise ValueError('同日志谱系副本位点不得高于主库初始位点')
+    primary=primaries[0]
+    if any(n['role']=='replica' and n['lineage']==primary['lineage'] and n['position']>primary['position'] for n in node_inputs):raise ValueError('同日志谱系副本位点不得高于主库初始位点')
+    return primary
+
+def choose_read_target(nodes,primary_name,state,at_ms,max_delay_ms,sticky_ms):
+    """原读路由规则：粘滞主库 / 合规副本 / 回退主库 / 拒绝。返回(节点或None,理由)。"""
+    primary=nodes[primary_name];required=state['required']
+    sticky=state['last_write_ms'] is not None and at_ms-state['last_write_ms']<sticky_ms
+    eligible=[n for n in nodes.values() if n['role']=='replica' and n['status']=='healthy' and n['lineage']==state['lineage'] and n['position']>=required and n['delay_ms']<=max_delay_ms]
+    candidates=sorted(eligible,key=lambda n:(n['delay_ms'],-n['position'],n['name']))
+    selected=None;reason=''
+    if sticky:
+        if primary['status']=='healthy' and primary['lineage']==state['lineage'] and primary['position']>=required:selected=primary;reason='写后读粘滞：保持主库'
+        else:reason='粘滞期主库不可用，拒绝不确定读取'
+    elif candidates:selected=candidates[0];reason='副本位点满足会话且延迟达标'
+    elif primary['status']=='healthy' and primary['lineage']==state['lineage'] and primary['position']>=required:selected=primary;reason='无安全达标副本，回退主库'
+    else:reason='主库不可用且无安全达标副本，拒绝读取'
+    return selected,reason
+
+def simulate(node_inputs,events,max_delay_ms,sticky_ms):
+    if not 1<=len(events)<=100:raise ValueError('需要1–100个时序事件')
+    if max_delay_ms<0 or sticky_ms<0:raise ValueError('延迟门槛和粘滞时间不得为负')
+    primary_input=validate_nodes(node_inputs)
+    nodes={x['name']:copy.deepcopy(x) for x in node_inputs};primary=nodes[primary_input['name']];lineage=primary['lineage'];sessions={};trace=[];last_time=-1
     for index,event in enumerate(events):
         at=event['at_ms'];kind=event['kind'];session=event.get('session','default')
         if at<last_time:raise ValueError('事件必须按时间非递减排列')
@@ -34,16 +54,7 @@ def simulate(node_inputs,events,max_delay_ms,sticky_ms):
                 row.update(node=primary['name'],decision='routed',reason='写入主库并记录会话位点',required_position=primary['position'],observed_position=primary['position'])
         elif kind=='read':
             state=sessions.get(session,{'required':0,'lineage':lineage,'last_write_ms':None});required=state['required'];row['required_position']=required
-            sticky=state['last_write_ms'] is not None and at-state['last_write_ms']<sticky_ms
-            eligible=[n for n in nodes.values() if n['role']=='replica' and n['status']=='healthy' and n['lineage']==state['lineage'] and n['position']>=required and n['delay_ms']<=max_delay_ms]
-            candidates=sorted(eligible,key=lambda n:(n['delay_ms'],-n['position'],n['name']))
-            selected=None
-            if sticky:
-                if primary['status']=='healthy' and primary['lineage']==state['lineage'] and primary['position']>=required:selected=primary;row['reason']='写后读粘滞：保持主库'
-                else:row['reason']='粘滞期主库不可用，拒绝不确定读取'
-            elif candidates:selected=candidates[0];row['reason']='副本位点满足会话且延迟达标'
-            elif primary['status']=='healthy' and primary['lineage']==state['lineage'] and primary['position']>=required:selected=primary;row['reason']='无安全达标副本，回退主库'
-            else:row['reason']='主库不可用且无安全达标副本，拒绝读取'
+            selected,row['reason']=choose_read_target(nodes,primary['name'],state,at,max_delay_ms,sticky_ms)
             if selected:row.update(node=selected['name'],decision='routed',observed_position=selected['position'],safe=selected['position']>=required and selected['lineage']==state['lineage'])
             else:row['decision']='rejected'
             row['replica_checks']=[{'name':n['name'],'healthy':n['status']=='healthy','same_lineage':n['lineage']==state['lineage'],'position_sufficient':n['position']>=required,'delay_within_limit':n['delay_ms']<=max_delay_ms} for n in nodes.values() if n['role']=='replica']
